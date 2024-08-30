@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>kanban</title>
+  <style id="css-board">
+    * {
+      margin: 0;
+      padding: 0;
+      font-weight: 100;
+    }
+
+    body {
+      margin: 1em;
+      font-family: Helvetica, sans-serif;
+      background-color: #fff;
+    }
+
+    .board {
+      width: 100%;
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      grid-template-rows: 100px;
+    }
+
+    .column {
+      background-color: #ccc;
+      margin: 0.5em;
+      min-height: 600px;
+    }
+
+    .column h2 {
+      line-height: 1em;
+      text-align: center;
+      padding: 0.5em;
+      background-color: #fc3;
+    }
+
+    .column h2 .count {
+      font-size: 0.8em;
+      font-weight: 200;
+      float:right;
+    }
+
+    .column.dragover {
+      background-color: #eee;
+    }
+
+    .column .entry {
+      background-color: #fff;
+      margin: 0.5em;
+      padding: 0.5em;
+      cursor: grab;
+/*      box-shadow: 5px 5px;*/
+    }
+
+    .entry h3 {
+      font-weight: 500;
+    }
+
+    .invisible {
+      display: none;
+    }
+
+    .dragclone {
+      border: 1px solid #999;
+      height: 50px;
+      margin: 0.5em;
+    }
+
+    button {
+      padding: 0.3em 0.5em;
+    }
+
+  </style>
+  <template id="tpl-board">
+    <header>
+      <p><button onclick="save()">save</button></p>
+      <!-- <nav>
+          <a href="#index">save</a>
+      </nav> -->
+    </header>
+    <div class="board">
+      {columns}
+    </div>
+    <footer>
+    </footer>
+  </template>
+  <template id="tpl-column">
+    <div class="column" data-title="{title}">
+      <div class="header">{header}</div>
+      <div class="entries">{entries}</div>
+    </div>
+  </template>
+  <template id="tpl-column-header">
+    <h2>{title}<span class="count">{count}</span></h2>
+  </template>
+  <template id="tpl-entry">
+    <div class="entry" draggable="true" data-column="{column}" data-index="{index}">
+      <h3>{title}</h3>
+      <div class="content">{content}</div>
+    </div>
+  </template>
+</head>
+<body>
+  <div id="board"></div>
+  <script id="data">
+    const data = {
+      columns: [
+        {t: 'backlog', e: [{t:'1 This is the title', c:'And this is the content.'}]},
+        {t: 'todo', e: [{t:'2 This is the title', c:'And this is the content.'}]},
+        {t: 'doing', e: [{t:'3 This is the title', c:'And this is the content.'}]},
+        {t: 'waiting', e: [{t:'4 This is the title', c:'And this is the content.'}]},
+        {t: 'done', e: [{t:'5 This is the title', c:'And this is the content.'}]}
+      ]
+    };
+  </script>
+  <script id="kanban">
+    
+    /* HELPERS */
+
+    const url = (...f) => [window.location.href.split('#')[0], ...f].join('');
+    const basename = (path) => path.split('/').pop().split('.').shift();
+    const $ = (s) => document.querySelector(s);
+    const $$ = (s) => document.querySelectorAll(s);
+    const t = (...args) => args.join('\n');
+    const ta = arr => t(...arr);
+
+    function makeElt(elt, cls = [], attrs = [], html = '', value = '') {
+        let e = document.createElement(elt);
+        cls.forEach(c => e.classList.add(c));
+        Object.entries(attrs).forEach(i => e.setAttribute(...i));
+        e.innerHTML = html;
+        e.value = value;
+        return e;
+    }
+
+    function download(d, n, type) {
+      const l = makeElt('a');
+      l.download = n;
+      l.href = window.URL.createObjectURL(new Blob([d], {type}));
+      document.body.appendChild(l);
+      l.click();
+      document.body.removeChild(l);
+    }
+    
+    let currentDragEntry = null;
+
+    // For sortable drag n drop:
+    let dropEntry = null;
+
+    function isBefore(el1, el2) {
+      if (el2.parentNode === el1.parentNode) {
+        for (var cur = el1.previousSibling; cur && cur.nodeType !== 9; cur = cur.previousSibling) {
+          if (cur === el2) return true;
+        }
+      }
+      return false;
+    }
+
+
+    /* TEMPLATE */
+    
+    function tpl (name, args = {}) {
+      return Object.entries(args).reduce((r, [k, v]) => {
+        const re = new RegExp(`{${k}}`, 'g');
+        return r.replace(re, v);
+      }, $(`#tpl-${name}`).innerHTML);
+    }
+
+    /* STORE */
+
+    function createStore(initialData={columns: []}) {
+      // deep clone data:
+      const data = JSON.parse(JSON.stringify(initialData));
+      const getColumn = (title) => data.columns.find((c) => c.t === title);
+      const mapColumns = (fn) => data.columns.map(fn);
+      const getEntries = (column) => getColumn(column).e;
+      const moveEntry = (oldIndex, newIndex, fromColumn, toColumn) => {
+        const oldEntries = getColumn(fromColumn).e;
+        const entry = oldEntries[oldIndex];
+        // remove entry from fromColumn:
+        oldEntries.splice(oldIndex, 1);
+        // insert entry at newIndex:
+        getColumn(toColumn).e.splice(newIndex, 0, entry);
+      }
+
+      return {
+        stringify: () => JSON.stringify(data),
+        getColumn,
+        getEntries,
+        mapColumns,
+        moveEntry,
+        columns: data.columns
+      }
+    }
+
+    const store = createStore(data)
+
+    /* EVENTS */
+
+    function onEntryDragStart() {
+      currentDragEntry = this;
+      // create fresh placeholder to see new position when dragging:
+      dropEntry = makeElt('div', ['dragclone']);
+      setTimeout(() => this.classList.add('invisible'), 0);
+    }
+
+    function onEntryDragEnter(e) {
+      e.preventDefault()
+      const self = this
+      if (isBefore(dropEntry, self)) {
+        // Before:
+        self.parentNode.insertBefore(dropEntry, self);
+      } else {
+        // After:
+        self.parentNode.insertBefore(dropEntry, self.nextSibling);
+      }
+    }
+
+    function onEntryDragEnd() {
+      currentDragEntry = null;
+      setTimeout(() => this.classList.remove('invisible'), 0);
+    }
+
+    function onColumnDragOver(e) {
+      e.preventDefault()
+    }
+    
+    function onColumnDragEnter() {
+      setTimeout(() => this.classList.add('dragover'), 0);
+    }
+
+    function onColumnDragLeave () {
+      setTimeout(() => this.classList.remove('dragover'), 0);
+    }
+
+    function onColumnDragDrop () {
+      const fromColumn = currentDragEntry.dataset.column;
+      const toColumn = this.dataset.title;
+      let newIndex = store.getEntries(toColumn).length;
+
+      const oldIndex = currentDragEntry.dataset.index;
+      
+      // calculate new position in this column:
+      if (dropEntry.parentNode) {
+        newIndex = [...dropEntry.parentNode.children].indexOf(dropEntry)
+      }
+
+      store.moveEntry(oldIndex, newIndex, fromColumn, toColumn);
+      currentDragEntry.dataset.index = newIndex;
+      
+      // console.log(newIndex, entries.length, this.querySelector('.entries').children.length);
+
+      showBoard();
+
+      // save();
+    }
+
+    /* CORE */
+
+    function init () {
+      showBoard();
+    }
+
+    function quine () {
+        //       `<div id="board">${htmlBlog(storeEntries().slice(0, 10))}</div>`,
+        // `<script id="store">let store = ${JSON.stringify(store).replaceAll('</' + 'script', "' + '</' + 'script' + '") + ';'};${'</'}script>`,
+        // `<script id="kanban">${$('script#kanban').innerHTML + '</'}script>`,
+      return t(
+        '<!DOCTYPE html>',
+        `<head>${document.head.innerHTML}</head>`,
+        '<body>',
+        '<div id="board"></div>',
+        `<script id="data">const data = ${store.stringify().replaceAll('</' + 'script', "' + '</' + 'script' + '")};${'</'}script>`,
+        `<script id="kanban">${$('script#kanban').innerHTML + '</'}script>`,
+        '</body></html>'
+      );
+    }
+
+    function save () {
+      download(quine(), basename(url()) + '.html', 'text/html');
+    }
+
+    /* RENDER */
+
+    function showBoard () {
+      $('#board').innerHTML = tpl('board', {
+        columns: ta(store.mapColumns(({t: cTitle, e: entries}) => tpl('column', {
+          title: cTitle,
+          header: tpl('column-header', {title: cTitle, count: entries.length}),
+          entries: ta(entries.map(({t: eTitle, c: content}, index) => tpl('entry', {
+            title: eTitle,
+            content,
+            column: cTitle,
+            index
+          })))
+        })))
+      });
+
+      $$('.entry').forEach((entry) => {
+        entry.addEventListener('dragstart', onEntryDragStart);
+        entry.addEventListener('dragend', onEntryDragEnd);
+        entry.addEventListener('dragenter', onEntryDragEnter);
+      })
+      $$('.column').forEach((column) => {
+        column.addEventListener('dragover', onColumnDragOver);
+        column.addEventListener('dragenter', onColumnDragEnter);
+        column.addEventListener('dragleave', onColumnDragLeave);
+        column.addEventListener('drop', onColumnDragDrop);
+      });
+    }
+
+    /* LISTENERS */
+
+    window.addEventListener('beforeunload', e => $('.dirty') && (e.preventDefault(), e.returnValue = true));
+
+
+    init()
+  </script>
+</body>
+</html>
